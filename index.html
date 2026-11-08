@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>对讲</title>
+<style>
+*{box-sizing:border-box;margin:0}
+html,body{height:100%}
+body{display:flex;flex-direction:column;height:100vh;height:100dvh;overflow:hidden;padding:12px;gap:10px;
+  font:18px/1.4 system-ui,"PingFang SC","Microsoft YaHei",sans-serif;background:#0d0d0d;color:#eee;
+  -webkit-user-select:none;user-select:none}
+#top{display:flex;align-items:center;gap:10px}
+#dot{width:18px;height:18px;border-radius:50%;background:#777;flex:none}
+#dot.ok{background:#3ddc84}#dot.mid{background:#f5c542}#dot.bad{background:#ff5a5a}
+#status{font-size:24px;font-weight:700;flex:1}
+#gear{background:#222;color:#999;border:0;border-radius:10px;font-size:22px;padding:6px 12px}
+#banner{min-height:80px;border-radius:18px;background:#1b1b1b;display:flex;align-items:center;justify-content:center;
+  font-size:30px;font-weight:700;color:#888;text-align:center;padding:0 10px}
+#banner.talk{background:#1e5d2f;color:#fff}
+#members{display:flex;flex-wrap:wrap;gap:8px;max-height:20vh;overflow:hidden}
+.m{padding:8px 16px;border-radius:24px;background:#222;font-size:22px;display:flex;align-items:center;gap:8px}
+.m i{width:12px;height:12px;border-radius:50%;background:#f5c542;display:inline-block}
+.m.ok i{background:#3ddc84}
+.m.bad i{background:#ff5a5a}
+.m.talk{background:#2e7d32;color:#fff}
+#ptt{flex:1;min-height:0;white-space:pre-line;border:0;border-radius:32px;background:#1565c0;color:#fff;font-size:44px;font-weight:700;line-height:1.3;
+  touch-action:none;-webkit-touch-callout:none}
+#ptt.on{background:#e53935}
+#ptt:disabled{opacity:.4}
+#log{height:4.6em;overflow-y:auto;background:#151515;border-radius:12px;padding:6px 10px;font-size:15px;color:#999;line-height:1.5;flex:none}
+#setup{position:fixed;inset:0;background:#0d0d0d;padding:24px;display:none;flex-direction:column;gap:12px;
+  -webkit-user-select:text;user-select:text}
+#setup.show{display:flex}
+#setup h2{font-size:28px}
+#setup label{font-size:20px;color:#bbb}
+#setup input[type=text]{width:100%;padding:16px;font-size:24px;border-radius:12px;border:1px solid #444;background:#000;color:#fff}
+#setup button{padding:18px;font-size:24px;border:0;border-radius:12px;background:#2f6fed;color:#fff;margin-top:6px}
+#setup .small{font-size:15px;color:#888}
+#err{color:#ff5a5a;min-height:22px}
+</style>
+</head>
+<body>
+<div id="top"><span id="dot"></span><div id="status">正在连接…</div><button id="gear">⚙</button></div>
+<div id="banner">正在启动…</div>
+<div id="members"></div>
+<button id="ptt" disabled>按住 说话</button>
+<div id="log"></div>
+
+<div id="setup">
+  <h2>设置</h2>
+  <label>我的名字</label><input type="text" id="name" maxlength="8" placeholder="例如：爸爸">
+  <label>房间号（全家填一样的）</label><input type="text" id="room" maxlength="24" placeholder="例如：wangjia2026">
+  <label class="small"><input type="checkbox" id="v6only"> 仅 IPv6 直连（调试用，一般不勾）</label>
+  <div id="err"></div>
+  <button id="save">进入</button>
+  <div class="small">建议同时在线不超过 6 人。房间号尽量取得别人猜不到。版本 v0.4</div>
+</div>
+
+<script src="mqtt.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const myId = Math.random().toString(36).slice(2, 8);
+const peers = new Map();            // id -> {name, pc, dc, audio, pending, talking, state, created}
+let stream, client, topic, myName = '', helloTimer, talking = false;
+const store = {
+  get: k => { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} }
+};
+function log(msg) {
+  const el = $('log'), t = new Date().toTimeString().slice(0, 5);
+  const d = document.createElement('div'); d.textContent = t + '  ' + msg; el.appendChild(d);
+  while (el.children.length > 60) el.removeChild(el.firstChild);
+  el.scrollTop = el.scrollHeight;
+}
+const esc = s => String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+const candAddr = c => (c || '').split(' ')[4];
+function allowCand(c) {
+  if (!c) return true;
+  const a = candAddr(c);
+  if (!a || a.endsWith('.local')) return false;
+  return $('v6only').checked ? a.includes(':') : true;
+}
+const iceServers = () => $('v6only').checked ? [] :
+  [{ urls: 'stun:stun.miwifi.com:3478' }, { urls: 'stun:stun.qq.com:3478' }, { urls: 'stun:stun.l.google.com:19302' }];
+
+// 提示音
+let actx;
+function beep(freq, ms) {
+  try {
+    actx = actx || new AudioContext();
+    if (actx.state === 'suspended') actx.resume();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.frequency.value = freq; g.gain.value = 0.15;
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + ms / 1000);
+  } catch (e) {}
+}
+
+// ---------- 界面 ----------
+function render() {
+  const list = [...peers.values()];
+  const conn = list.filter(p => p.state === 'connected').length;
+  let html = `<div class="m ok"><i></i>${esc(myName)}（我）</div>`;
+  list.forEach(p => {
+    const cls = p.state === 'connected' ? ' ok' : (p.state === 'failed' || p.state === 'disconnected') ? ' bad' : '';
+    html += `<div class="m${cls}${p.talking ? ' talk' : ''}"><i></i>${esc(p.name || '…')}</div>`;
+  });
+  $('members').innerHTML = html;
+  const talkers = list.filter(p => p.talking).map(p => esc(p.name || '有人'));
+  const b = $('banner');
+  if (talkers.length) { b.innerHTML = '🔊 ' + talkers.join('、') + ' 在说话'; b.className = 'talk'; }
+  else { b.textContent = conn ? '没人说话' : (client && client.connected ? '等家人上线…' : '正在连接…'); b.className = ''; }
+  const online = client && client.connected;
+  $('status').textContent = online ? (conn ? `已连上 ${conn + 1} 人` : '只有我在线') : '网络连接中…';
+  $('dot').className = !online ? 'bad' : conn ? 'ok' : 'mid';
+  $('ptt').disabled = !stream;
+}
+
+// ---------- 信令 ----------
+function send(m, to) {
+  if (!client || !client.connected) return;
+  m.from = myId; m.name = myName; if (to) m.to = to;
+  client.publish(topic, JSON.stringify(m));
+}
+
+function getPeer(id, name) {
+  let p = peers.get(id);
+  if (p) { if (name) p.name = name; return p; }
+  p = { id, name, pending: [], talking: false, state: 'new', created: Date.now() };
+  const pc = p.pc = new RTCPeerConnection({ iceServers: iceServers() });
+  p.dc = pc.createDataChannel('ctl', { negotiated: true, id: 0 });
+  p.dc.onopen = () => { if (talking) p.dc.send(JSON.stringify({ t: 'talk', on: true })); };
+  p.dc.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.t === 'talk') {
+      if (m.on && !p.talking) beep(880, 80);
+      if (!m.on && p.talking) beep(520, 80);
+      p.talking = m.on; render();
+    }
+  };
+  p.audio = new Audio(); p.audio.autoplay = true;
+  pc.ontrack = e => { p.audio.srcObject = e.streams[0] || new MediaStream([e.track]); p.audio.play().catch(() => {}); };
+  pc.onicecandidate = e => { if (e.candidate && allowCand(e.candidate.candidate)) send({ type: 'cand', data: e.candidate.toJSON() }, id); };
+  log((name || '家人') + ' 上线，正在连接…');
+  pc.onconnectionstatechange = () => {
+    const prev = p.state;
+    p.state = pc.connectionState;
+    if (p.state !== prev) {
+      if (p.state === 'connected') log((p.name || '家人') + ' 已连上 ✅');
+      else if (p.state === 'disconnected') log((p.name || '家人') + ' 信号不好，正在重连…');
+      else if (p.state === 'failed') log((p.name || '家人') + ' 连不上 ❌（对方网络可能不支持直连，稍后自动重试）');
+    }
+    if (p.state === 'failed' || p.state === 'closed') dropPeer(id);
+    render();
+  };
+  peers.set(id, p); render();
+  return p;
+}
+function dropPeer(id) {
+  const p = peers.get(id); if (!p) return;
+  peers.delete(id);
+  try { p.pc.close(); } catch (e) {}
+  if (p.audio) p.audio.srcObject = null;
+  render();
+}
+// 不说话时不挂麦克风轨道 → 完全不发语音包，省流量
+// 发起方新建音频通道；接听方必须用对方 offer 里那条通道（否则声音发不出去）
+function bindSender(p, offerer) {
+  const tr = offerer
+    ? p.pc.addTransceiver('audio', { direction: 'sendrecv', streams: [stream] })
+    : p.pc.getTransceivers().find(t => t.receiver.track.kind === 'audio');
+  if (!tr) return;
+  tr.direction = 'sendrecv';
+  if (!offerer && tr.sender.setStreams) tr.sender.setStreams(stream);
+  p.sender = tr.sender;
+  if (talking) p.sender.replaceTrack(stream.getAudioTracks()[0]).catch(() => {});
+}
+const flush = p => { p.pending.forEach(c => p.pc.addIceCandidate(c).catch(() => {})); p.pending = []; };
+
+async function onSignal(m) {
+  const id = m.from;
+  if (m.type === 'hello' || m.type === 'here') {
+    let p = peers.get(id);
+    // 长时间连不上的旧连接：丢掉重建
+    if (p && p.state !== 'connected' && Date.now() - p.created > 15000) { dropPeer(id); p = null; }
+    if (!p) {
+      if (m.type === 'hello') send({ type: 'here' }, id);
+      p = getPeer(id, m.name);
+      if (myId < id) {                       // ID 小的一方发起
+        bindSender(p, true);
+        await p.pc.setLocalDescription(await p.pc.createOffer());
+        send({ type: 'offer', data: p.pc.localDescription.toJSON() }, id);
+      }
+    } else if (m.name && p.name !== m.name) { p.name = m.name; render(); }
+  } else if (m.type === 'bye') {
+    if (peers.has(id)) log((peers.get(id).name || '家人') + ' 下线了');
+    dropPeer(id);
+  } else if (m.type === 'offer') {
+    let p = peers.get(id);
+    if (p && p.pc.remoteDescription) { dropPeer(id); p = null; }
+    p = p || getPeer(id, m.name);
+    await p.pc.setRemoteDescription(m.data); flush(p);
+    bindSender(p, false);
+    await p.pc.setLocalDescription(await p.pc.createAnswer());
+    send({ type: 'answer', data: p.pc.localDescription.toJSON() }, id);
+  } else if (m.type === 'answer') {
+    const p = peers.get(id);
+    if (p && p.pc.signalingState === 'have-local-offer') { await p.pc.setRemoteDescription(m.data); flush(p); }
+  } else if (m.type === 'cand') {
+    if (!allowCand(m.data.candidate)) return;
+    const p = peers.get(id) || getPeer(id, m.name);
+    if (p.pc.remoteDescription) p.pc.addIceCandidate(m.data).catch(() => {});
+    else p.pending.push(m.data);
+  }
+}
+
+function leave() {
+  send({ type: 'bye' });
+  [...peers.keys()].forEach(dropPeer);
+  clearInterval(helloTimer);
+  if (client) { try { client.end(true); } catch (e) {} }
+  client = null;
+}
+
+async function start() {
+  const name = $('name').value.trim(), room = $('room').value.trim();
+  if (!name || !room) { $('err').textContent = '名字和房间号都要填'; return; }
+  if (typeof mqtt === 'undefined') { $('err').textContent = '组件加载失败，请重启 App'; return; }
+  $('err').textContent = '';
+  myName = name;
+  store.set('name', name); store.set('room', room); store.set('v6', $('v6only').checked ? '1' : '');
+  $('setup').classList.remove('show');
+    leave();
+  try {
+    if (!stream) {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    }
+  } catch (e) { $('banner').textContent = '❌ 没有麦克风权限'; log('请在手机设置里允许「对讲」使用麦克风'); return; }
+  topic = 'ptt-family/' + room;
+  client = mqtt.connect('wss://broker.emqx.io:8084/mqtt', { clientId: 'pf_' + myId, clean: true, reconnectPeriod: 3000, keepalive: 30 });
+  client.on('connect', () => { log('已进入房间 ' + room); client.subscribe(topic, () => send({ type: 'hello' })); render(); });
+  client.on('close', render);
+  client.on('offline', () => { log('网络断开，正在重连…'); render(); });
+  client.on('message', (t, buf) => {
+    let m; try { m = JSON.parse(buf.toString()); } catch (e) { return; }
+    if (m.from === myId || (m.to && m.to !== myId)) return;
+    onSignal(m).catch(() => {});
+  });
+  helloTimer = setInterval(() => send({ type: 'hello' }), 10000);   // 定时广播，后加入/断线重连的人能互相发现
+  render();
+}
+
+// ---------- 按住说话 ----------
+function talk(on) {
+  if (!stream || on === talking) return;
+  talking = on;
+  const track = stream.getAudioTracks()[0];
+  const b = $('ptt');
+  b.classList.toggle('on', on);
+  b.textContent = on ? '正在说话\n松开 结束' : '按住 说话';
+  if (on) beep(1200, 60);
+  peers.forEach(p => {
+    if (p.sender) p.sender.replaceTrack(on ? track : null).catch(() => {});
+    if (p.dc && p.dc.readyState === 'open') p.dc.send(JSON.stringify({ t: 'talk', on }));
+    if (p.audio) p.audio.play().catch(() => {});
+  });
+}
+const btn = $('ptt');
+btn.addEventListener('pointerdown', e => { e.preventDefault(); btn.setPointerCapture(e.pointerId); talk(true); });
+['pointerup', 'pointercancel', 'lostpointercapture'].forEach(ev => btn.addEventListener(ev, () => talk(false)));
+btn.addEventListener('contextmenu', e => e.preventDefault());
+
+// ---------- 启动 ----------
+$('save').onclick = start;
+$('gear').onclick = () => $('setup').classList.add('show');
+window.addEventListener('pagehide', () => send({ type: 'bye' }));
+$('name').value = store.get('name');
+$('room').value = store.get('room');
+$('v6only').checked = store.get('v6') === '1';
+if ($('name').value && $('room').value) start();     // 记住设置，打开即自动进入
+else $('setup').classList.add('show');
+render();
+</script>
+</body>
+</html>
